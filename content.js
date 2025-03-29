@@ -1,24 +1,37 @@
+function getScreenResolution() {
+    if (typeof window !== "undefined" && window.innerWidth && window.innerHeight) {
+        return `${window.innerWidth}x${window.innerHeight}`;
+    }
+    return "unknown"; 
+}
+
 function sendLog(eventType, details) {
   if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       let log = {
           timestamp: new Date().toISOString(),
           type: eventType,
           details: details,
-          url: window.location.href
+          url: window.location.href,
+          userAgent: navigator.userAgent,
+          userLanguage: navigator.language || navigator.userLanguage,
+          screenResolution: getScreenResolution() // Utilisation de la fonction sécurisée
       };
 
       chrome.runtime.sendMessage(log, (response) => {
-          if (chrome.runtime.lastError) {
-              console.error("❌ Erreur d'envoi du log :", chrome.runtime.lastError.message);
-          } else {
-              console.log("✅ Log envoyé :", response);
-          }
-      });
+        if (chrome.runtime.lastError) {
+            console.error("Erreur d'envoi du log :", chrome.runtime.lastError.message);
+        } else if (response && response.status === "success") {
+            console.log("Log enregistré :", response.log);
+        } else {
+            console.warn("Aucune réponse ou réponse inattendue :", response);
+        }
+    });    
   } else {
       console.error("❌ chrome.runtime non disponible !");
   }
 }
 
+ 
 
 
 // Capture les clics avec position et élément

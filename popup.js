@@ -1,23 +1,33 @@
+// popup.js
 document.addEventListener("DOMContentLoaded", function () {
     let logsContainer = document.getElementById("logs");
     let clearButton = document.getElementById("clearLogs");
 
-    // Charger les logs depuis chrome.storage.local
-    chrome.storage.local.get(["logs"], (result) => {
-        let logs = result.logs || [];
-        if (logs.length === 0) {
-            logsContainer.innerHTML = "Aucune interaction enregistrée.";
-        } else {
-            logsContainer.innerHTML = logs.map(log => 
-                `<p><strong>${log.type}</strong>: ${log.details?.text || log.details?.key || "N/A"} (${new Date(log.timestamp).toLocaleTimeString()})</p>`
-            ).join("");
-        }
-    });
+    // Charger les logs depuis le serveur
+    function loadLogs() {
+        fetch("http://localhost:3000/logs")
+            .then(response => response.json())
+            .then(logs => {
+                if (logs.length === 0) {
+                    logsContainer.innerHTML = "Aucune interaction enregistrée.";
+                } else {
+                    logsContainer.innerHTML = logs.map(log =>
+                        `<p><strong>${log.type}</strong>: ${log.details?.text || log.details?.field || "N/A"} 
+                        (${new Date(log.timestamp).toLocaleTimeString()})</p>`
+                    ).join("");
+                }
+            })
+            .catch(error => {
+                console.error("Erreur de récupération des logs :", error);
+                logsContainer.innerHTML = "Erreur de chargement des logs.";
+            });
+    }
 
-    // Effacer les logs
+    loadLogs(); // Charger les logs au démarrage
+
+    // Ajouter un bouton pour rafraîchir les logs
     clearButton.addEventListener("click", function () {
-        chrome.storage.local.set({ logs: [] }, () => {
-            logsContainer.innerHTML = "Logs effacés.";
-        });
+        logsContainer.innerHTML = "Chargement...";
+        loadLogs();
     });
 });
