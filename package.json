@@ -1,8 +1,9 @@
-
 {
   "dependencies": {
     "cors": "^2.8.5",
+    "ee-first": "^1.1.1",
     "express": "^4.21.2",
+    "express-validator": "^7.2.1",
     "pg": "^8.14.1"
   }
 }

@@ -1,54 +1,38 @@
-// server.js
-import express from "express";
-import pg from "pg";
-import cors from "cors";
-
+const { body, validationResult } = require("express-validator");
+const express = require("express");
+const pool = require("./db");
 const app = express();
 const port = 3000;
+const cors = require('cors');
 
-// Connexion à PostgreSQL
-const pool = new pg.Pool({
-  user: "postgres",
-  host: "localhost",
-  database: "tracker_db",
-  password: "admin", 
-  port: 5432,
-});
-
+app.use(express.json()); 
 app.use(cors());
-app.use(express.json());
 
-// Log toutes les requêtes reçues
-app.use((req, res, next) => {
-    console.log(`Requête reçue: ${req.method} ${req.url}`);
-    next();
-});
-
-// Endpoint pour sauvegarder un log
 app.post("/logs", async (req, res) => {
-    console.log("Données reçues:", req.body);
+    const { timestamp, type, details, url, user_agent, user_language, screen_resolution } = req.body;
 
-    const { timestamp, type, details, url, userAgent, userLanguage, screenResolution } = req.body;
-
-    if (!timestamp || !type || !details || !url || !userAgent || !userLanguage || !screenResolution) {
-        return res.status(400).json({ error: "Champs manquants" });
-    }
+    // Log les valeurs reçues
+    console.log("Timestamp:", timestamp);
+    console.log("Type:", type);
+    console.log("Details:", details);
+    console.log("URL:", url);
+    console.log("User-Agent:", user_agent);
+    console.log("User Language:", user_language);
+    console.log("Screen Resolution:", screen_resolution);
 
     try {
-        const query = `
-            INSERT INTO logs (timestamp, type, details, url, user_agent, user_language, screen_resolution) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7) 
-            RETURNING *`;
-        const values = [timestamp, type, JSON.stringify(details), url, userAgent, userLanguage, screenResolution];
+        await pool.query(`
+            INSERT INTO logs (timestamp, type, details, url, user_agent, user_language, screen_resolution)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [timestamp, type, details, url, user_agent, user_language, screen_resolution]);
 
-        const result = await pool.query(query, values);
-        console.log("Log enregistré dans PostgreSQL :", result.rows[0]);
-        res.json({ message: "Log enregistré", log: result.rows[0] });
+        res.json({ status: "success", message: "Log enregistré" });
     } catch (error) {
-        console.error("Erreur PostgreSQL :", error);
-        res.status(500).json({ error: "Erreur lors de l'insertion du log" });
+        console.error("Erreur d'enregistrement du log :", error);
+        res.status(500).json({ status: "error", error: "Erreur serveur" });
     }
 });
+
 
 // Endpoint pour récupérer les logs
 app.get("/logs", async (req, res) => {

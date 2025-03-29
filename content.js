@@ -6,33 +6,30 @@ function getScreenResolution() {
 }
 
 function sendLog(eventType, details) {
-  if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+    if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       let log = {
           timestamp: new Date().toISOString(),
           type: eventType,
           details: details,
           url: window.location.href,
-          userAgent: navigator.userAgent,
-          userLanguage: navigator.language || navigator.userLanguage,
-          screenResolution: getScreenResolution() // Utilisation de la fonction sécurisée
+          user_agent: navigator.userAgent || "unknown" ,  // Correction ici
+          user_language: navigator.language || navigator.userLanguage,  // Utilisation correcte
+          screen_resolution: getScreenResolution()
       };
-
+      
       chrome.runtime.sendMessage(log, (response) => {
-        if (chrome.runtime.lastError) {
-            console.error("Erreur d'envoi du log :", chrome.runtime.lastError.message);
-        } else if (response && response.status === "success") {
-            console.log("Log enregistré :", response.log);
-        } else {
-            console.warn("Aucune réponse ou réponse inattendue :", response);
-        }
-    });    
-  } else {
-      console.error("❌ chrome.runtime non disponible !");
+          if (chrome.runtime.lastError) {
+              console.error("Erreur d'envoi du log :", chrome.runtime.lastError.message);
+          } else if (response && response.status === "success") {
+              console.log("Log enregistré :", response.log);
+          } else {
+              console.warn("Aucune réponse ou réponse inattendue :", response);
+          }
+      });    
+    } else {
+        console.error(" chrome.runtime non disponible !");
+    }
   }
-}
-
- 
-
 
 // Capture les clics avec position et élément
 document.addEventListener("click", (event) => {
@@ -64,6 +61,7 @@ window.addEventListener("error", (event) => {
 
 // Capture les requêtes réseau (XHR et Fetch)
 function trackNetworkRequests() {
+if (!window.fetch.isTracked) {
   let originalFetch = window.fetch;
   window.fetch = async function (...args) {
       let startTime = performance.now();
@@ -81,6 +79,8 @@ function trackNetworkRequests() {
           throw error;
       }
   };
+  window.fetch.isTracked = true;
+}
 
   let originalXHR = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function (...args) {
