@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracker Framadate</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 10px;
+            width: 300px;
+        }
+        h2 {
+            font-size: 16px;
+            text-align: center;
+        }
+        #logs {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 5px;
+            font-size: 12px;
+            background: #f9f9f9;
+        }
+        button {
+            width: 100%;
+            padding: 8px;
+            margin-top: 5px;
+            cursor: pointer;
+            border: none;
+            background: #007bff;
+            color: white;
+            border-radius: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <h2>Interactions enregistrées</h2>
+    <div id="logs">Chargement des logs...</div>
+    <button id="clearLogs">Effacer les logs</button>
+
+    <script src="popup.js"></script>
+</body>
+</html>
