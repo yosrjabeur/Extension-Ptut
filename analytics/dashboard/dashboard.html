@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+</head>
+<body>
+    <h1>Dashboard en temps réel</h1>
+    <h2>Temps d'exécution des tâches</h2>
+    <ul>
+        {% for task, data in metrics.task_execution.average_times.items() %}
+            <li>{{ task }}: {{ data.avg }}s (Expert: {{ data.expert_avg }})</li>
+        {% endfor %}
+    </ul>
+    <!-- Ajoutez d'autres sections -->
+</body>
+</html>
