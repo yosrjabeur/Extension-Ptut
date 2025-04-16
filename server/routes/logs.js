@@ -9,7 +9,7 @@ let redisClient;
 async function connectToRedis() {
     try {
         redisClient = redis.createClient({
-            url: 'redis://172.22.198.52:6379',  
+            url: 'redis://172.19.23.119:6379',  
             socket: {
                 connectTimeout: 5000,
                 reconnectStrategy: (retries) => {

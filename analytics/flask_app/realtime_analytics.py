@@ -34,7 +34,7 @@ def connect_to_redis():
     for attempt in range(max_retries):
         try:
             client = redis.Redis(
-                host='172.22.198.52',
+                host='172.19.23.119',
                 port=6379,
                 decode_responses=True
             )
@@ -76,26 +76,23 @@ metrics = {
     'interactions_by_element': defaultdict(int),
     'network_requests': [],
     'by_domain': defaultdict(lambda: defaultdict(int)),
-    'user_sessions': defaultdict(list),  
+    'user_sessions': defaultdict(list),
     'session_activity': [],
     'user_activity': [],
     'error_details': [],
 }
+
 metrics_lock = Lock()
 
-def convert_strings_to_timestamps(obj):
-    if isinstance(obj, str):
-        try:
-            # Try to parse the string as a datetime
-            return pd.to_datetime(obj)
-        except (ValueError, TypeError):
-            return obj  # If it's not a datetime string, return as-is
+def convert_timestamps_to_strings(obj):
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
     elif isinstance(obj, dict):
-        return {k: convert_strings_to_timestamps(v) for k, v in obj.items()}
+        return {k: convert_timestamps_to_strings(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_strings_to_timestamps(item) for item in obj]
+        return [convert_timestamps_to_strings(item) for item in obj]
     elif isinstance(obj, set):
-        return {convert_strings_to_timestamps(item) for item in obj}
+        return {convert_timestamps_to_strings(item) for item in obj}
     return obj
 
 def load_metrics():
@@ -109,17 +106,17 @@ def load_metrics():
             cleaned_redundant = {}
             for key, value in raw_redundant.items():
                 parts = key.split(':')
-                if len(parts) < 6:
+                if len(parts) < 5:
                     logger.warning(f"Clé mal formée supprimée de redundant_actions : {key}")
                     continue
                 try:
-                    timestamp = ':'.join(parts[5:])
+                    timestamp = ':'.join(parts[4:])
                     pd.to_datetime(timestamp)
                     cleaned_redundant[key] = value
                 except Exception as e:
                     logger.warning(f"Timestamp invalide dans redundant_actions, clé supprimée : {key}, erreur : {e}")
                     continue
-            metrics['redundant_actions'] = cleaned_redundant
+            metrics['redundant_actions'] = defaultdict(int, cleaned_redundant)
             metrics['help_usage'] = int(redis_client.get('metrics:help_usage') or 0)
             metrics['tutorial_usage'] = int(redis_client.get('metrics:tutorial_usage') or 0)
             metrics['feature_usage'] = json.loads(redis_client.get('metrics:feature_usage') or '{}')
@@ -135,28 +132,43 @@ def load_metrics():
             by_domain = defaultdict(lambda: defaultdict(int))
             by_domain.update(raw_by_domain)
             metrics['by_domain'] = by_domain
-            # Charger user_sessions et s'assurer que c'est un defaultdict(list)
             raw_user_sessions = json.loads(redis_client.get('metrics:user_sessions') or '{}')
             user_sessions = defaultdict(list)
             user_sessions.update(raw_user_sessions)
             metrics['user_sessions'] = user_sessions
             metrics['session_activity'] = convert_strings_to_timestamps(json.loads(redis_client.get('metrics:session_activity') or '[]'))
-            metrics['user_activity'] = convert_strings_to_timestamps(json.loads(redis_client.get('metrics:user_activity') or '[]'))
+            # Normalisation des timestamps dans user_activity
+            raw_user_activity = convert_strings_to_timestamps(json.loads(redis_client.get('metrics:user_activity') or '[]'))
+            normalized_user_activity = []
+            for activity in raw_user_activity:
+                ts = ensure_tz_aware(activity['timestamp'])
+                if ts is not None:
+                    activity['timestamp'] = ts
+                    normalized_user_activity.append(activity)
+                else:
+                    logger.warning(f"Timestamp invalide dans user_activity, activité ignorée : {activity}")
+            metrics['user_activity'] = normalized_user_activity
             metrics['error_details'] = convert_strings_to_timestamps(json.loads(redis_client.get('metrics:error_details') or '[]'))
         logger.info("Métriques chargées depuis Redis")
     except Exception as e:
         logger.error(f"Erreur lors du chargement des métriques : {e}")
 
 # Sauvegarder les métriques dans Redis
-def convert_timestamps_to_strings(obj):
-    if isinstance(obj, pd.Timestamp):
-        return obj.isoformat()
+def convert_strings_to_timestamps(obj):
+    if isinstance(obj, str):
+        try:
+            ts = pd.to_datetime(obj)
+            if ts.tzinfo is None:
+                return ts.tz_localize('UTC')
+            return ts.tz_convert('UTC')
+        except (ValueError, TypeError):
+            return obj
     elif isinstance(obj, dict):
-        return {k: convert_timestamps_to_strings(v) for k, v in obj.items()}
+        return {k: convert_strings_to_timestamps(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_timestamps_to_strings(item) for item in obj]
+        return [convert_strings_to_timestamps(item) for item in obj]
     elif isinstance(obj, set):
-        return {convert_timestamps_to_strings(item) for item in obj}
+        return {convert_strings_to_timestamps(item) for item in obj}
     return obj
 
 def save_metrics():
@@ -248,74 +260,96 @@ def periodic_cleanup():
 # Validation des logs
 def validate_log(log):
     required_fields = ['timestamp', 'type', 'user_id', 'session_id']
+    errors = []
+
     for field in required_fields:
-        if field not in log:
-            raise ValueError(f"Champ requis manquant : {field}")
+        if field not in log or log[field] is None or (isinstance(log[field], str) and not log[field].strip()):
+            errors.append(f"Champ requis manquant ou vide : {field}")
+
     try:
         pd.to_datetime(log['timestamp'])
     except Exception as e:
-        raise ValueError(f"Timestamp invalide : {log['timestamp']}, erreur : {e}")
+        errors.append(f"Timestamp invalide : {log['timestamp']}, erreur : {e}")
+
     valid_types = [
         'task_start', 'task_end', 'error', 'cancel', 'click', 'input',
         'help_access', 'tutorial_access', 'shortcut', 'alert_shown', 'alert_response',
-        'network', 'network-error', 'page_engagement'
+        'network', 'network-error', 'page_engagement', 'redundant', 'form-error', 'validation-error'
     ]
     if log['type'] not in valid_types:
-        raise ValueError(f"Type de log invalide : {log['type']}")
-    # Vérification des détails spécifiques
-    if 'details' not in log:
-        log['details'] = {}
-    # Vérification des champs numériques
+        errors.append(f"Type de log invalide : {log['type']}")
+
     if log['type'] == 'page_engagement':
         try:
             float(log['details'].get('active_time', '0s').replace('s', ''))
             float(log['details'].get('max_scroll_depth', '0%').replace('%', ''))
         except (ValueError, TypeError) as e:
-            raise ValueError(f"Valeurs invalides dans page_engagement : {e}")
+            errors.append(f"Valeurs invalides dans page_engagement : {e}")
+
+    if log['type'] in ['task_start', 'task_end']:
+        if 'task_id' not in log or not log['task_id']:
+            errors.append(f"task_id manquant pour le log de type {log['type']}")
+        if 'details' not in log or not isinstance(log['details'], dict):
+            errors.append(f"details manquant ou invalide pour le log de type {log['type']}")
+        else:
+            if 'name' not in log['details'] or not log['details']['name']:
+                errors.append(f"Nom de la tâche manquant dans details pour le log de type {log['type']}")
+
+    if errors:
+        error_message = "Erreurs détectées dans le log : " + "; ".join(errors)
+        logger.error(f"{error_message}\nLog: {json.dumps(log)}")
+        redis_client.lpush('errors', f"{error_message}: {json.dumps(log)}")
+        raise ValueError(error_message)
+
     return True
 
 # Nettoyage des données
 def cleanup_metrics():
-    current_time = pd.to_datetime(datetime.utcnow())
+    current_time = pd.to_datetime(datetime.now(timezone.utc))
     cutoff_24h = current_time - pd.Timedelta(hours=24)
     cutoff_5min = current_time - pd.Timedelta(minutes=5)
+
     with metrics_lock:
-        # Nettoyage des tâches
+        # Détection des tâches non terminées (timeout de 15 minutes)
+        for task in metrics['task_times']:
+            if 'end' not in task and not task['is_cancelled']:
+                task_start = ensure_tz_aware(task['start'])
+                if task_start and (current_time - task_start).total_seconds() >= 900:  # 15 minutes
+                    task['is_cancelled'] = True
+                    task['end'] = current_time
+                    task['duration'] = (task['end'] - task['start']).total_seconds()
+                    logger.info(f"Tâche non terminée (timeout) : {task}")
+                    redis_client.lpush('cancellations', f"Tâche non terminée (timeout) : task_id={task['task_id']}, user_id={task['user_id']}, domain={task['domain']}")
+
         metrics['task_times'] = [
             task for task in metrics['task_times']
-            if ('duration' not in task and (current_time - task['start']).total_seconds() < 900)  # 15 minutes
-            or ('duration' in task and task['start'] > cutoff_24h)
+            if ('duration' not in task and (current_time - ensure_tz_aware(task['start'])).total_seconds() < 900)
+            or ('duration' in task and ensure_tz_aware(task['start']) > cutoff_24h)
         ]
-        # Nettoyage des alertes
         metrics['alert_times'] = [
             alert for alert in metrics['alert_times']
-            if ('response_time' not in alert and (current_time - alert['start']).total_seconds() < 900)
-            or ('response_time' in alert and alert['start'] > cutoff_24h)
+            if ('response_time' not in alert and (current_time - ensure_tz_aware(alert['start'])).total_seconds() < 900)
+            or ('response_time' in alert and ensure_tz_aware(alert['start']) > cutoff_24h)
         ]
-        # Nettoyage des requêtes réseau (24h)
         metrics['network_requests'] = [
             req for req in metrics['network_requests']
-            if pd.to_datetime(req['timestamp']) > cutoff_24h
+            if ensure_tz_aware(req['timestamp']) > cutoff_24h
         ]
-        # Nettoyage des données d'engagement (24h)
         metrics['page_engagement'] = [
             eng for eng in metrics['page_engagement']
-            if pd.to_datetime(eng['timestamp']) > cutoff_24h
+            if ensure_tz_aware(eng['timestamp']) > cutoff_24h
         ]
-        # Nettoyage des sessions (24h)
         metrics['session_activity'] = [
             session for session in metrics['session_activity']
-            if pd.to_datetime(session['start']) > cutoff_24h
+            if ensure_tz_aware(session['start']) > cutoff_24h
         ]
-        # Nettoyage des activités utilisateur (24h)
         metrics['user_activity'] = [
             activity for activity in metrics['user_activity']
-            if pd.to_datetime(activity['timestamp']) > cutoff_24h
+            if ensure_tz_aware(activity['timestamp']) > cutoff_24h
         ]
-        # Nettoyage des détails des erreurs (24h)
         metrics['error_details'] = [
             error for error in metrics['error_details']
-            if pd.to_datetime(error['timestamp']) > cutoff_24h
+            if ensure_tz_aware(error['timestamp']) > cutoff_24h
         ]
 
 def process_log(log):
@@ -333,13 +367,10 @@ def process_log(log):
                 domain = domain[4:]
         log['domain'] = domain
 
-        # Sanitize task name
         task_name = details.get('name', 'unknown')
-        # Check if the task name looks like a URL
         if task_name.startswith('http://') or task_name.startswith('https://'):
             logger.warning(f"Task name appears to be a URL: {task_name}. Attempting to infer task type.")
-            # Infer task name based on context (e.g., form submission)
-            if log_type == 'task_start' or log_type == 'task_end':
+            if log_type in ['task_start', 'task_end']:
                 if 'form' in log['url'].lower():
                     task_name = 'form_submit'
                 else:
@@ -348,31 +379,101 @@ def process_log(log):
                 task_name = 'unknown'
         details['name'] = task_name
 
+        timestamp = ensure_tz_aware(log['timestamp'])
+        if timestamp is None:
+            raise ValueError(f"Timestamp invalide dans le log : {log['timestamp']}")
+        log['timestamp'] = timestamp
+
         with metrics_lock:
             metrics['total_actions'] += 1
             metrics['by_domain'][domain]['total_actions'] += 1
 
+            # Ajout à user_activity pour toutes les actions
+            activity = {
+                'user_id': user_id,
+                'session_id': session_id,
+                'timestamp': timestamp,
+                'type': log_type,
+                'domain': domain,
+                'feature': details.get('feature', 'N/A'),
+                'details': details
+            }
+            metrics['user_activity'].append(activity)
+            logger.debug(f"Activité ajoutée à user_activity : {activity}")
+
+            # Gestion des sessions
             if session_id not in metrics['user_sessions'][user_id]:
                 metrics['user_sessions'][user_id].append(session_id)
                 metrics['session_activity'].append({
                     'user_id': user_id,
                     'session_id': session_id,
-                    'start': pd.to_datetime(log['timestamp']),
+                    'start': timestamp,
                     'actions': 0,
-                    'domains': set(),
-                    'features': set(),
+                    'domains': [],
+                    'features': [],
                     'errors': 0
                 })
             for session in metrics['session_activity']:
                 if session['user_id'] == user_id and session['session_id'] == session_id:
                     session['actions'] += 1
-                    session['domains'].add(domain)
-                    session['features'].add(details.get('feature', 'N/A'))
-                    if log_type in ['error', 'network-error']:
+                    session['domains'].append(domain)
+                    feature = details.get('feature', 'N/A')
+                    if feature not in session['features']:
+                        session['features'].append(feature)
+                    if log_type in ['error', 'network-error', 'form-error', 'validation-error', 'alert-error', 'input-error', 'input-correction', 'task-failure', 'submit-failure']:
                         session['errors'] += 1
                     if 'end' not in session:
-                        session['duration'] = (pd.to_datetime(log['timestamp']) - session['start']).total_seconds()
+                        session['duration'] = (timestamp - session['start']).total_seconds()
 
+            # Gestion des logs de type "shortcut"
+            if log_type == 'shortcut':
+                combination = details.get('combination')
+                if not combination:
+                    logger.warning(f"Log de type 'shortcut' sans 'combination' dans details : {log}")
+                    details['combination'] = 'Unknown'
+
+            # Gestion des logs de type "redundant"
+            if log_type == 'redundant':
+                action_type = details.get('action_type', 'unknown')
+                count = details.get('count', 1)
+                if not isinstance(count, int) or count < 0:
+                    logger.warning(f"Valeur de count invalide dans log de type redundant : {count}, utilisation de la valeur par défaut 1")
+                    count = 1
+                redundant_key = f"{user_id}:{session_id}:{action_type}:{details.get('action_detail', 'unknown')}:{timestamp.isoformat()}"
+                metrics['redundant_actions'][redundant_key] = metrics['redundant_actions'].get(redundant_key, 0) + count
+                logger.debug(f"Action redondante enregistrée : {redundant_key} -> {count}")
+
+            # Gestion des logs de type "alert_response"
+            if log_type == 'alert_response':
+                start_time = details.get('start_time')
+                if start_time:
+                    start_time = ensure_tz_aware(start_time)
+                    response_time = (timestamp - start_time).total_seconds()
+                    metrics['alert_times'].append({
+                        'start': start_time,
+                        'end': timestamp,
+                        'response_time': response_time,
+                        'message': details.get('message', 'N/A'),
+                        'domain': domain
+                    })
+
+            # Détection des actions redondantes pour les clics et les saisies
+            if log_type in ['click', 'input']:
+                action_key = f"{log_type}:{details.get('element', 'unknown')}:{details.get('value', 'unknown')}"
+                recent_actions = [
+                    a for a in metrics['user_activity']
+                    if a['user_id'] == user_id
+                    and a['session_id'] == session_id
+                    and a['type'] == log_type
+                    and f"{a['type']}:{a['details'].get('element', 'unknown')}:{a['details'].get('value', 'unknown')}" == action_key
+                    and (timestamp - ensure_tz_aware(a['timestamp'])).total_seconds() <= 5
+                ]
+                if recent_actions:
+                    redundant_key = f"{user_id}:{session_id}:{log_type}:{details.get('element', 'unknown')}:{timestamp.isoformat()}"
+                    metrics['redundant_actions'][redundant_key] = metrics['redundant_actions'].get(redundant_key, 0) + 1
+                    logger.debug(f"Action redondante détectée : {redundant_key} -> {metrics['redundant_actions'][redundant_key]}")
+
+            # Gestion des tâches
             task_id = log.get('task_id')
             if task_id:
                 if log_type == 'task_start':
@@ -382,39 +483,197 @@ def process_log(log):
                         'user_id': user_id,
                         'session_id': session_id,
                         'domain': domain,
-                        'name': task_name,  # Use sanitized task name
-                        'start': pd.to_datetime(log['timestamp']),
-                        'is_completed': False
+                        'name': task_name,
+                        'start': timestamp,
+                        'is_completed': False,
+                        'is_cancelled': False,
+                        'form_id': details.get('form_id', 'unknown'),
+                        'last_activity': timestamp
                     }
                     metrics['task_times'].append(task_entry)
                     logger.debug(f"Tâche démarrée : {task_entry}")
                 elif log_type == 'task_end':
                     for task in metrics['task_times']:
-                        if task['task_id'] == task_id and not task['is_completed']:
+                        if task['task_id'] == task_id and not task.get('is_completed_processed', False):
                             task['is_completed'] = details.get('is_task_completed', False)
-                            task['end'] = pd.to_datetime(log['timestamp'])
+                            task['end'] = timestamp
                             task['duration'] = (task['end'] - task['start']).total_seconds()
-                            task['name'] = task_name  # Update task name if necessary
+                            task['name'] = task_name
+                            task['reason'] = details.get('reason', None)
+                            task['is_completed_processed'] = True
+                            if task['is_completed']:
+                                task['is_cancelled'] = False
+                                metrics['tasks_completed'] += 1
+                            else:
+                                error_message = f"Échec de la tâche: {task_name}"
+                                if task['reason']:
+                                    error_message += f", raison: {task['reason']}"
+                                error_entry = {
+                                    'timestamp': timestamp,
+                                    'type': 'task-failure',
+                                    'message': error_message,
+                                    'domain': domain,
+                                    'user_id': user_id,
+                                    'session_id': session_id,
+                                    'details': {'task_name': task_name, 'reason': task['reason']},
+                                    'error_key': f"{user_id}:{session_id}:task-failure:{task_id}"
+                                }
+                                if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                                    metrics['error_details'].append(error_entry)
+                                    redis_client.lpush('errors_popup', f"Échec de tâche détecté : {error_message}, user_id={user_id}, domain={domain}")
+                                    logger.info(f"Échec de tâche enregistré dans metrics['error_details'] : {error_entry}")
+                                    logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
                             logger.debug(f"Tâche terminée : {task}")
                             break
-                    else:
-                        logger.warning(f"task_end reçu pour une tâche inconnue ou déjà terminée : task_id={task_id}")
+                elif log_type == 'cancel':
+                    for task in metrics['task_times']:
+                        if task['task_id'] == task_id and not task['is_completed']:
+                            task['is_cancelled'] = True
+                            task['end'] = timestamp
+                            task['duration'] = (task['end'] - task['start']).total_seconds()
+                            logger.info(f"Tâche annulée : {task}")
+                            redis_client.lpush('cancellations', f"Tâche annulée : task_id={task_id}, user_id={user_id}, domain={domain}, form_id={details.get('form_id', 'unknown')}")
+                            break
+                else:
+                    for task in metrics['task_times']:
+                        if task['session_id'] == session_id and not task['is_completed']:
+                            task['last_activity'] = timestamp
 
-            metrics['user_activity'].append({
-                'user_id': user_id,
-                'session_id': session_id,
-                'timestamp': log['timestamp'],
-                'type': log_type,
-                'domain': domain,
-                'feature': details.get('feature', 'N/A'),
-                'details': details
-            })
-            logger.debug(f"Activité ajoutée à user_activity : {metrics['user_activity'][-1]}")
+            # Gestion des erreurs explicites (error, form-error, validation-error, network-error)
+            if log_type in ['error', 'network-error', 'form-error', 'validation-error']:
+                error_message = details.get('message', 'Erreur inconnue')
+                error_entry = {
+                    'timestamp': timestamp,
+                    'type': log_type,
+                    'message': error_message,
+                    'domain': domain,
+                    'user_id': user_id,
+                    'session_id': session_id,
+                    'details': details,
+                    'error_key': f"{user_id}:{session_id}:{log_type}:{timestamp.isoformat()}"
+                }
+                if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                    metrics['error_details'].append(error_entry)
+                    redis_client.lpush('errors_popup', f"Erreur détectée : {error_message}, user_id={user_id}, domain={domain}")
+                    logger.info(f"Erreur explicite enregistrée dans metrics['error_details'] : {error_entry}")
+                    logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
+
+            # Détection des messages d'erreur affichés à l'utilisateur via alert_shown
+            if log_type == 'alert_shown':
+                message = details.get('message', '').lower()
+                error_keywords = ['error', 'erreur', 'invalid', 'invalide', 'failed', 'échoué', 'fail', 'échec', 'required', 'requis']
+                if any(keyword in message for keyword in error_keywords):
+                    error_entry = {
+                        'timestamp': timestamp,
+                        'type': 'alert-error',
+                        'message': f"Message d'erreur affiché: {message}",
+                        'domain': domain,
+                        'user_id': user_id,
+                        'session_id': session_id,
+                        'details': details,
+                        'error_key': f"{user_id}:{session_id}:alert-error:{timestamp.isoformat()}"
+                    }
+                    if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                        metrics['error_details'].append(error_entry)
+                        redis_client.lpush('errors_popup', f"Message d'erreur affiché : {message}, user_id={user_id}, domain={domain}")
+                        logger.info(f"Erreur d'alerte enregistrée dans metrics['error_details'] : {error_entry}")
+                        logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
+
+            # Détection des erreurs de saisie via les logs 'input'
+            if log_type == 'input':
+                input_field = details.get('element', 'unknown')
+                recent_activities = [
+                    a for a in metrics['user_activity']
+                    if a['user_id'] == user_id
+                    and a['session_id'] == session_id
+                    and (timestamp - ensure_tz_aware(a['timestamp'])).total_seconds() <= 5  # Réduit à 5 secondes
+                ]
+                has_error_alert = False
+                for activity in recent_activities:
+                    # Vérifier si un message d'erreur est lié à cet input
+                    if activity['type'] == 'alert_shown':
+                        message = activity['details'].get('message', '').lower()
+                        error_keywords = ['error', 'invalid', 'required', 'erreur', 'invalide', 'requis']
+                        alert_field = activity['details'].get('field', '').lower()  # Vérifier si l'alerte spécifie un champ
+                        if any(keyword in message for keyword in error_keywords) and (not alert_field or alert_field == input_field.lower()):
+                            error_entry = {
+                                'timestamp': timestamp,
+                                'type': 'input-error',
+                                'message': f"Erreur de saisie détectée: {activity['details'].get('message', 'Champ invalide')}",
+                                'domain': domain,
+                                'user_id': user_id,
+                                'session_id': session_id,
+                                'details': {'input_value': details.get('value', ''), 'field': input_field},
+                                'error_key': f"{user_id}:{session_id}:input-error:{input_field}:{timestamp.isoformat()}"
+                            }
+                            if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                                metrics['error_details'].append(error_entry)
+                                redis_client.lpush('errors_popup', f"Erreur de saisie détectée : {error_entry['message']}, user_id={user_id}, domain={domain}")
+                                logger.info(f"Erreur de saisie enregistrée dans metrics['error_details'] : {error_entry}")
+                                logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
+                            has_error_alert = True
+                            break
+                # Détection des corrections rapides uniquement si une erreur a été détectée
+                if has_error_alert:
+                    for activity in recent_activities:
+                        if activity['type'] == 'input' and activity['details'].get('element') == input_field and activity['details'].get('value') != details.get('value'):
+                            error_entry = {
+                                'timestamp': timestamp,
+                                'type': 'input-correction',
+                                'message': "Correction rapide détectée après une saisie erronée",
+                                'domain': domain,
+                                'user_id': user_id,
+                                'session_id': session_id,
+                                'details': {
+                                    'original_value': details.get('value', ''),
+                                    'corrected_value': activity['details'].get('value', ''),
+                                    'field': input_field
+                                },
+                                'error_key': f"{user_id}:{session_id}:input-correction:{input_field}:{timestamp.isoformat()}"
+                            }
+                            if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                                metrics['error_details'].append(error_entry)
+                                redis_client.lpush('errors_popup', f"Correction rapide détectée : {error_entry['message']}, user_id={user_id}, domain={domain}")
+                                logger.info(f"Correction de saisie enregistrée dans metrics['error_details'] : {error_entry}")
+                                logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
+                            break
+
+            # Détection des clics répétés sur "submit"
+            if log_type == 'click' and details.get('element', '').lower() in ['submit', 'button-submit', 'btn-submit']:
+                recent_actions = [
+                    a for a in metrics['user_activity']
+                    if a['user_id'] == user_id
+                    and a['session_id'] == session_id
+                    and a['type'] == 'click'
+                    and a['details'].get('element', '').lower() in ['submit', 'button-submit', 'btn-submit']
+                    and (timestamp - ensure_tz_aware(a['timestamp'])).total_seconds() <= 5
+                ]
+                if len(recent_actions) > 1:
+                    error_message = "Clics répétés sur le bouton de soumission (échec potentiel de soumission)"
+                    error_entry = {
+                        'timestamp': timestamp,
+                        'type': 'submit-failure',
+                        'message': error_message,
+                        'domain': domain,
+                        'user_id': user_id,
+                        'session_id': session_id,
+                        'details': {'click_count': len(recent_actions), 'element': 'submit'},
+                        'error_key': f"{user_id}:{session_id}:submit-failure:{timestamp.isoformat()}"
+                    }
+                    if not any(e.get('error_key') == error_entry['error_key'] for e in metrics['error_details']):
+                        metrics['error_details'].append(error_entry)
+                        redis_client.lpush('errors_popup', f"Erreur détectée : {error_message}, user_id={user_id}, domain={domain}")
+                        logger.info(f"Erreur de soumission répétée enregistrée dans metrics['error_details'] : {error_entry}")
+                        logger.debug(f"Total des erreurs après ajout : {len(metrics['error_details'])}")
+
         save_metrics_transactional()
+
     except Exception as e:
-        logger.error(f"Erreur traitement log : {e}\nTrace: {traceback.format_exc()}\nLog: {log}")
-        redis_client.lpush('errors', f"{str(e)}: {json.dumps(log)}") 
-        
+        error_message = f"Erreur traitement log : {e}\nTrace: {traceback.format_exc()}\nLog: {log}"
+        logger.error(error_message)
+        redis_client.lpush('errors_popup', error_message)
+        redis_client.lpush('errors', error_message)
+
 # Écoute Redis
 def listen_redis():
     logger.info("Démarrage de l'écoute Redis sur le canal logs:realtime")
@@ -422,11 +681,12 @@ def listen_redis():
         if message['type'] == 'message':
             try:
                 log = json.loads(message['data'])
+                logger.info(f"Log brut reçu via Redis : {log}")
                 process_log(log)
             except Exception as e:
                 logger.error(f"Erreur traitement log : {e}\nTrace: {traceback.format_exc()}\nMessage: {message['data']}")
                 redis_client.lpush('errors', f"{str(e)}: {message['data']}")
-
+                
 # Fonction utilitaire pour calculer des statistiques avancées
 def compute_advanced_stats(records, key):
     values = [r[key] for r in records if key in r]
@@ -445,8 +705,18 @@ def compute_advanced_stats(records, key):
         result['note'] = "All durations are 0, possibly due to simultaneous task_start and task_end events."
     return result
 
+def ensure_tz_aware(timestamp):
+    try:
+        ts = pd.to_datetime(timestamp)
+        if ts.tzinfo is None:
+            return ts.tz_localize('UTC')
+        return ts.tz_convert('UTC')
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Timestamp invalide : {timestamp}, erreur : {e}")
+        return None
+    
 # 1. Analyse des temps d'exécution des tâches
-@app.route('/metrics/task-execution-time', methods=['GET'])
+@app.route('/metrics/task-stats', methods=['GET'])
 def get_task_execution_time():
     domain_filter = request.args.get('domain')
     user_id_filter = request.args.get('user_id')
@@ -530,156 +800,237 @@ def get_task_execution_time():
     })
     
 # 2. Analyse des erreurs et annulations
-@app.route('/metrics/errors-and-cancellations', methods=['GET'])
+@app.route('/metrics/errors', methods=['GET'])
 def get_errors_and_cancellations():
     domain_filter = request.args.get('domain')
     time_window = request.args.get('time_window', '24h')
+
     try:
+        current_time = pd.to_datetime(datetime.now(timezone.utc))
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = current_time - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = current_time - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
-    except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = current_time - pd.Timedelta(hours=24)
+        logger.info(f"Appel à /metrics/errors - time_window: {time_window}, domain_filter: {domain_filter}, cutoff: {cutoff}")
+    except ValueError as e:
+        logger.error(f"Erreur lors du parsing de time_window '{time_window}': {e}")
+        cutoff = current_time - pd.Timedelta(hours=24)
 
-    with metrics_lock:
-        errors_filtered = [
-            e for e in metrics['error_details']
-            if pd.to_datetime(e['timestamp']) >= cutoff
-            and (domain_filter is None or e['domain'] == domain_filter)
-        ]
-        total_actions_filtered = sum(
-            1 for a in metrics['user_activity']
-            if pd.to_datetime(a['timestamp']) >= cutoff
-            and (domain_filter is None or a['domain'] == domain_filter)
-        ) or 1  # Éviter division par 0
-        error_rate = (len(errors_filtered) / total_actions_filtered * 100)
-        cancellations_filtered = sum(
-            1 for a in metrics['user_activity']
-            if a['type'] == 'cancel' and pd.to_datetime(a['timestamp']) >= cutoff
-            and (domain_filter is None or a['domain'] == domain_filter)
-        )
-        cancellation_rate = (cancellations_filtered / total_actions_filtered * 100)
+    try:
+        with metrics_lock:
+            # Vérifier le contenu brut de metrics['error_details'] avant filtrage
+            logger.debug(f"Contenu brut de metrics['error_details']: {metrics['error_details']}")
 
-        # Analyse par type d'erreur
-        df_errors = pd.DataFrame(errors_filtered)
-        error_types = df_errors.groupby('type').size().to_dict() if not df_errors.empty else {}
-        error_messages = df_errors.groupby('message').size().to_dict() if not df_errors.empty else {}
+            # Filtrer les erreurs
+            errors_filtered = []
+            for e in metrics['error_details']:
+                ts = ensure_tz_aware(e['timestamp'])
+                if ts is None:
+                    logger.warning(f"Timestamp invalide dans error_details: {e}")
+                    continue
+                if ts >= cutoff and (domain_filter is None or e['domain'] == domain_filter):
+                    errors_filtered.append(e)
+                else:
+                    logger.debug(f"Erreur ignorée - timestamp: {ts}, domain: {e['domain']}, cutoff: {cutoff}, domain_filter: {domain_filter}")
 
-        # Analyse par domaine
-        by_domain = {}
-        for domain in metrics['by_domain']:
-            if domain_filter and domain != domain_filter:
-                continue
-            domain_errors = len([
-                e for e in errors_filtered if e['domain'] == domain
-            ])
-            domain_actions = sum(
-                1 for a in metrics['user_activity']
-                if a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
-            ) or 1
-            domain_cancellations = sum(
-                1 for a in metrics['user_activity']
-                if a['type'] == 'cancel' and a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
+            logger.debug(f"Erreurs filtrées: {len(errors_filtered)}, détails: {errors_filtered}")
+
+            # Filtrer les activités utilisateur
+            user_activity_filtered = [
+                a for a in metrics['user_activity']
+                if (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
+                and (domain_filter is None or a['domain'] == domain_filter)
+            ]
+            total_actions_filtered = len(user_activity_filtered) or 1
+            logger.debug(f"Actions filtrées: {total_actions_filtered}")
+
+            # Calculer les métriques globales
+            error_rate = (len(errors_filtered) / total_actions_filtered * 100)
+            cancellations_filtered = sum(
+                1 for task in metrics['task_times']
+                if task['is_cancelled'] and not task['is_completed']
+                and (ts := ensure_tz_aware(task['end'])) is not None and ts >= cutoff
+                and (domain_filter is None or task['domain'] == domain_filter)
             )
-            by_domain[domain] = {
-                'errors': domain_errors,
-                'error_rate': round((domain_errors / domain_actions * 100), 2),
-                'cancellations': domain_cancellations,
-                'cancellation_rate': round((domain_cancellations / domain_actions * 100), 2)
-            }
+            cancellation_rate = (cancellations_filtered / total_actions_filtered * 100)
 
-    return jsonify({
-        'errors': len(errors_filtered),
-        'error_rate': round(error_rate, 2),
-        'error_types': error_types,
-        'error_messages': error_messages,
-        'cancellations': cancellations_filtered,
-        'cancellation_rate': round(cancellation_rate, 2),
-        'total_actions': total_actions_filtered,
-        'by_domain': by_domain
-    })
+            # Analyse des types et messages d'erreurs
+            df_errors = pd.DataFrame(errors_filtered)
+            error_types = df_errors.groupby('type').size().to_dict() if not df_errors.empty else {}
+            error_messages = df_errors.groupby('message').size().to_dict() if not df_errors.empty else {}
 
+            # Analyse des erreurs de formulaire (inclure les nouveaux types)
+            form_errors = [
+                e for e in errors_filtered
+                if e['type'] in ['form-error', 'validation-error', 'task-failure', 'submit-failure', 'input-error', 'input-correction', 'alert-error']
+            ]
+            form_error_count = len(form_errors)
+            form_error_rate = (form_error_count / total_actions_filtered * 100) if total_actions_filtered > 0 else 0
+            form_error_messages = pd.DataFrame(form_errors).groupby('message').size().to_dict() if form_errors else {}
 
+            # Analyse par domaine
+            by_domain = {}
+            domains = {domain_filter} if domain_filter else set(metrics['by_domain'].keys())
+            for domain in domains:
+                domain_errors = [
+                    e for e in errors_filtered if e['domain'] == domain
+                ]
+                domain_form_errors = [
+                    e for e in form_errors if e['domain'] == domain
+                ]
+                domain_actions = [
+                    a for a in user_activity_filtered if a['domain'] == domain
+                ]
+                domain_action_count = len(domain_actions) or 1
+                domain_cancellations = sum(
+                    1 for task in metrics['task_times']
+                    if task['domain'] == domain and task['is_cancelled'] and not task['is_completed']
+                    and (ts := ensure_tz_aware(task['end'])) is not None and ts >= cutoff
+                )
+                by_domain[domain] = {
+                    'errors': len(domain_errors),
+                    'error_rate': round((len(domain_errors) / domain_action_count * 100), 2),
+                    'form_errors': len(domain_form_errors),
+                    'form_error_rate': round((len(domain_form_errors) / domain_action_count * 100), 2),
+                    'cancellations': domain_cancellations,
+                    'cancellation_rate': round((domain_cancellations / domain_action_count * 100), 2),
+                    'total_actions': domain_action_count
+                }
+
+            # Préparer les détails des erreurs pour la réponse
+            error_details = [
+                {
+                    'timestamp': e['timestamp'].isoformat(),
+                    'type': e['type'],
+                    'message': e['message'],
+                    'domain': e['domain'],
+                    'user_id': e['user_id'],
+                    'session_id': e['session_id'],
+                    'details': e.get('details', {})
+                } for e in errors_filtered
+            ]
+
+        logger.info(f"Retour des métriques - erreurs: {len(errors_filtered)}, types: {error_types}")
+        return jsonify({
+            'errors': len(errors_filtered),
+            'error_rate': round(error_rate, 2),
+            'error_types': error_types,
+            'error_messages': error_messages,
+            'form_errors': form_error_count,
+            'form_error_rate': round(form_error_rate, 2),
+            'form_error_messages': form_error_messages,
+            'cancellations': cancellations_filtered,
+            'cancellation_rate': round(cancellation_rate, 2),
+            'total_actions': total_actions_filtered,
+            'by_domain': by_domain,
+            'error_details': error_details
+        })
+
+    except Exception as e:
+        logger.error(f"Erreur dans get_errors_and_cancellations : {str(e)}\nTrace: {traceback.format_exc()}")
+        return jsonify({'error': f'Erreur serveur: {str(e)}'}), 500 
+     
 # 3. Analyse des actions redondantes
 @app.route('/metrics/redundant-actions', methods=['GET'])
 def get_redundant_actions():
     domain_filter = request.args.get('domain')
     time_window = request.args.get('time_window', '24h')
+
     try:
+        current_time = pd.to_datetime(datetime.now(timezone.utc))
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = current_time - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = current_time - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
-    except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = current_time - pd.Timedelta(hours=24)
+    except ValueError as e:
+        logger.error(f"Erreur lors du parsing de time_window '{time_window}': {e}")
+        cutoff = current_time - pd.Timedelta(hours=24)
 
-    with metrics_lock:
-        total_actions_filtered = sum(
-            1 for a in metrics['user_activity']
-            if pd.to_datetime(a['timestamp']) >= cutoff
-            and (domain_filter is None or a['domain'] == domain_filter)
-        ) or 1
-        total_redundant = 0
-        redundant_by_type = defaultdict(int)
-        by_domain = {}
+    try:
+        with metrics_lock:
+            user_activity_filtered = [
+                a for a in metrics['user_activity']
+                if (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
+                and (domain_filter is None or a['domain'] == domain_filter)
+            ]
+            total_actions_filtered = len(user_activity_filtered) or 1
+            logger.debug(f"Total actions filtered: {total_actions_filtered}, domain_filter: {domain_filter}, cutoff: {cutoff}")
 
-        for key, count in metrics['redundant_actions'].items():
-            parts = key.split(':')
-            if len(parts) < 5:  
-                logger.warning(f"Clé mal formée dans redundant_actions : {key}")
-                continue
-            user_id, session_id, action_type, action_detail, timestamp = parts[0], parts[1], parts[2], parts[3], ':'.join(parts[4:])
-            try:
-                action_time = pd.to_datetime(timestamp)
-            except Exception as e:
-                logger.error(f"Erreur lors du parsing du timestamp dans redundant_actions : {timestamp}, erreur : {e}")
-                continue
-            # Trouver le domaine associé via user_activity
-            domain = None
+            domain_action_counts = defaultdict(int)
+            for activity in user_activity_filtered:
+                domain_action_counts[activity['domain']] += 1
+            for domain in domain_action_counts:
+                domain_action_counts[domain] = domain_action_counts[domain] or 1
+
+            total_redundant = 0
+            redundant_by_type = defaultdict(int)
+            by_domain = defaultdict(lambda: {'total_redundant': 0, 'redundant_rate': 0.0})
+
+            # Créer un index des activités par user_id et session_id
+            activity_index = defaultdict(list)
             for activity in metrics['user_activity']:
-                if activity['user_id'] == user_id and activity['session_id'] == session_id and activity['timestamp'] == timestamp:
-                    domain = activity['domain']
-                    break
-            if domain is None:
-                logger.warning(f"Domaine non trouvé pour la clé : {key}")
-                continue
-            if (domain_filter is None or domain == domain_filter) and action_time >= cutoff:
-                total_redundant += count
-                redundant_by_type[action_type] += count
-                # Mise à jour des métriques par domaine
-                if domain not in by_domain:
-                    domain_actions = sum(
-                        1 for a in metrics['user_activity']
-                        if a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
-                    ) or 1
-                    by_domain[domain] = {
-                        'total_redundant': 0,
-                        'redundant_rate': 0.0,
-                        'domain_actions': domain_actions
-                    }
-                by_domain[domain]['total_redundant'] += count
+                key = (activity['user_id'], activity['session_id'])
+                activity_index[key].append(activity)
 
-        # Calculer les taux par domaine
-        for domain in by_domain:
-            by_domain[domain]['redundant_rate'] = round(
-                (by_domain[domain]['total_redundant'] / by_domain[domain]['domain_actions'] * 100), 2
-            )
-            del by_domain[domain]['domain_actions']  # Supprimer le champ temporaire
+            logger.debug(f"Contenu de metrics['redundant_actions']: {dict(metrics['redundant_actions'])}")
 
-        redundant_rate = (total_redundant / total_actions_filtered * 100)
+            for key, count in metrics['redundant_actions'].items():
+                parts = key.split(':')
+                if len(parts) < 5:
+                    logger.warning(f"Clé mal formée dans redundant_actions : {key}")
+                    continue
+                user_id, session_id, action_type, action_detail, timestamp = parts[0], parts[1], parts[2], parts[3], ':'.join(parts[4:])
+                try:
+                    action_time = ensure_tz_aware(timestamp)
+                    if action_time is None:
+                        logger.warning(f"Timestamp invalide pour la clé dans redundant_actions : {key}")
+                        continue
+                except Exception as e:
+                    logger.error(f"Erreur lors du parsing du timestamp pour la clé {key} dans redundant_actions : {timestamp}, erreur : {e}")
+                    continue
 
-    return jsonify({
-        'redundant_actions': dict(redundant_by_type),
-        'total_redundant': total_redundant,
-        'redundant_rate': round(redundant_rate, 2),
-        'total_actions': total_actions_filtered,
-        'by_domain': by_domain
-    })
+                domain = None
+                # Rechercher le domaine dans toutes les activités de la session
+                for activity in activity_index.get((user_id, session_id), []):
+                    activity_time = ensure_tz_aware(activity['timestamp'])
+                    time_diff = abs((activity_time - action_time).total_seconds())
+                    if time_diff < 1:  # Tolérance de 1 seconde
+                        domain = activity['domain']
+                        break
+                if domain is None:
+                    logger.warning(f"Domaine non trouvé pour la clé : {key}")
+                    continue
+
+                if (domain_filter is None or domain == domain_filter) and action_time >= cutoff:
+                    total_redundant += count
+                    redundant_by_type[action_type] += count
+                    by_domain[domain]['total_redundant'] += count
+                else:
+                    logger.debug(f"Action redondante ignorée - domaine: {domain}, action_time: {action_time}, domain_filter: {domain_filter}, cutoff: {cutoff}")
+
+            for domain in by_domain:
+                domain_actions = domain_action_counts.get(domain, 1)
+                by_domain[domain]['redundant_rate'] = round(
+                    (by_domain[domain]['total_redundant'] / domain_actions * 100), 2
+                )
+
+            redundant_rate = (total_redundant / total_actions_filtered * 100)
+
+            return jsonify({
+                'redundant_actions': dict(redundant_by_type),
+                'total_redundant': total_redundant,
+                'redundant_rate': round(redundant_rate, 2),
+                'total_actions': total_actions_filtered,
+                'by_domain': dict(by_domain)
+            })
+
+    except Exception as e:
+        logger.error(f"Erreur dans get_redundant_actions : {str(e)}")
+        return jsonify({'error': 'Erreur serveur lors du calcul des métriques.'}), 500
     
 # 4. Analyse de l'utilisation de l'aide et des tutoriels
 @app.route('/metrics/help-and-tutorials', methods=['GET'])
@@ -833,24 +1184,25 @@ def get_task_completion_rate():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         tasks_started = sum(
             1 for a in metrics['user_activity']
-            if a['type'] == 'task_start' and pd.to_datetime(a['timestamp']) >= cutoff
+            if a['type'] == 'task_start' and (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
+            or (ts is None and logger.warning(f"Timestamp invalide dans user_activity : {a['timestamp']}"))
         )
         tasks_completed = sum(
             1 for a in metrics['user_activity']
             if a['type'] == 'task_end' and a['details'].get('is_task_completed', False)
-            and pd.to_datetime(a['timestamp']) >= cutoff
+            and (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         )
         completion_rate = (tasks_completed / tasks_started * 100) if tasks_started > 0 else 0
@@ -862,12 +1214,14 @@ def get_task_completion_rate():
                 continue
             domain_started = sum(
                 1 for a in metrics['user_activity']
-                if a['type'] == 'task_start' and a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
+                if a['type'] == 'task_start' and a['domain'] == domain
+                and (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
             )
             domain_completed = sum(
                 1 for a in metrics['user_activity']
                 if a['type'] == 'task_end' and a['details'].get('is_task_completed', False)
-                and a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
+                and a['domain'] == domain
+                and (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
             )
             by_domain[domain] = {
                 'tasks_started': domain_started,
@@ -889,34 +1243,57 @@ def get_shortcut_usage():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
+
+    logger.debug(f"Cutoff calculé : {cutoff}")
+    logger.debug(f"Domain filter : {domain_filter}")
 
     with metrics_lock:
+        logger.debug(f"Contenu de metrics['user_activity'] : {metrics['user_activity']}")
+
+        # Calculer le total des actions filtrées
         total_actions_filtered = sum(
             1 for a in metrics['user_activity']
-            if pd.to_datetime(a['timestamp']) >= cutoff
+            if ensure_tz_aware(a['timestamp']) >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         ) or 1
+        logger.debug(f"Total actions filtered : {total_actions_filtered}")
+
+        # Calculer l'utilisation des raccourcis
         shortcut_usage = sum(
             1 for a in metrics['user_activity']
-            if a['type'] == 'shortcut' and pd.to_datetime(a['timestamp']) >= cutoff
+            if a['type'] == 'shortcut' and ensure_tz_aware(a['timestamp']) >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         )
         shortcut_rate = (shortcut_usage / total_actions_filtered * 100)
+        logger.debug(f"Shortcut usage : {shortcut_usage}, Shortcut rate : {shortcut_rate}")
 
-        # Analyse par combinaison de raccourcis
+        # Créer le DataFrame pour les raccourcis
         df_shortcuts = pd.DataFrame([
             a for a in metrics['user_activity']
-            if a['type'] == 'shortcut' and pd.to_datetime(a['timestamp']) >= cutoff
+            if a['type'] == 'shortcut' and ensure_tz_aware(a['timestamp']) >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         ])
-        shortcut_combinations = df_shortcuts.groupby('details.combination').size().to_dict() if not df_shortcuts.empty else {}
+        logger.debug(f"Données filtrées (df_shortcuts) : {df_shortcuts.to_dict('records') if not df_shortcuts.empty else 'Vide'}")
+
+        # Analyse par combinaison de raccourcis
+        shortcut_combinations = {}
+        if not df_shortcuts.empty:
+            # Extraire la clé 'combination' depuis 'details'
+            df_shortcuts['combination'] = df_shortcuts['details'].apply(
+                lambda x: x.get('combination', 'Unknown') if isinstance(x, dict) else 'Unknown'
+            )
+            # Log si des raccourcis n'ont pas de 'combination'
+            missing_combinations = df_shortcuts[df_shortcuts['combination'] == 'Unknown']
+            if not missing_combinations.empty:
+                logger.warning(f"Raccourcis sans 'combination' : {missing_combinations.to_dict('records')}")
+            shortcut_combinations = df_shortcuts.groupby('combination').size().to_dict()
 
         # Analyse par domaine
         by_domain = {}
@@ -925,16 +1302,17 @@ def get_shortcut_usage():
                 continue
             domain_actions = sum(
                 1 for a in metrics['user_activity']
-                if a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
+                if a['domain'] == domain and ensure_tz_aware(a['timestamp']) >= cutoff
             ) or 1
             domain_shortcuts = sum(
                 1 for a in metrics['user_activity']
-                if a['type'] == 'shortcut' and a['domain'] == domain and pd.to_datetime(a['timestamp']) >= cutoff
+                if a['type'] == 'shortcut' and a['domain'] == domain and ensure_tz_aware(a['timestamp']) >= cutoff
             )
             by_domain[domain] = {
                 'shortcut_usage': domain_shortcuts,
                 'shortcut_usage_rate': round((domain_shortcuts / domain_actions * 100), 2)
             }
+        logger.debug(f"Statistiques par domaine (by_domain) : {by_domain}")
 
     return jsonify({
         'shortcut_usage': shortcut_usage,
@@ -951,39 +1329,51 @@ def get_alert_response_time():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
+
+    logger.debug("Cutoff calculé : %s", cutoff)
+    logger.debug("Domain filter : %s", domain_filter)
 
     with metrics_lock:
+        logger.debug("Contenu de metrics['alert_times'] : %s", metrics['alert_times'])
         df_alerts = pd.DataFrame([
             a for a in metrics['alert_times']
-            if 'response_time' in a and a['start'] >= cutoff
+            if 'response_time' in a and ensure_tz_aware(a['start']) >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         ])
+        logger.debug("Données filtrées (df_alerts) : %s", df_alerts.to_dict('records') if not df_alerts.empty else "Vide")
+
         stats = compute_advanced_stats(df_alerts.to_dict('records'), 'response_time') if not df_alerts.empty else {}
+        logger.debug("Statistiques globales (stats) : %s", stats)
 
         # Analyse par message
         by_message = df_alerts.groupby('message').apply(
             lambda x: compute_advanced_stats(x.to_dict('records'), 'response_time')
         ).to_dict() if not df_alerts.empty else {}
+        logger.debug("Statistiques par message (by_message) : %s", by_message)
 
         # Analyse par domaine
         by_domain = df_alerts.groupby('domain').apply(
             lambda x: compute_advanced_stats(x.to_dict('records'), 'response_time')
         ).to_dict() if not df_alerts.empty else {}
+        logger.debug("Statistiques par domaine (by_domain) : %s", by_domain)
 
         # Taux de réponse
+        logger.debug("Contenu de metrics['user_activity'] : %s", metrics['user_activity'])
         alerts_shown = sum(
             1 for a in metrics['user_activity']
-            if a['type'] == 'alert_shown' and pd.to_datetime(a['timestamp']) >= cutoff
+            if a['type'] == 'alert_shown' and ensure_tz_aware(a['timestamp']) >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         )
+        logger.debug("Nombre d'alertes affichées (alerts_shown) : %s", alerts_shown)
         response_rate = (len(df_alerts) / alerts_shown * 100) if alerts_shown > 0 else 0
+        logger.debug("Taux de réponse (response_rate) : %s", response_rate)
 
     return jsonify({
         'stats': stats,
@@ -1000,18 +1390,18 @@ def get_feature_usage():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc), utc=True) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_activity = pd.DataFrame([
             a for a in metrics['user_activity']
-            if a['feature'] != 'N/A' and pd.to_datetime(a['timestamp']) >= cutoff
+            if a['feature'] != 'N/A' and (ts := ensure_tz_aware(a['timestamp'])) is not None and ts >= cutoff
             and (domain_filter is None or a['domain'] == domain_filter)
         ])
         feature_counts = df_activity.groupby('feature').size().to_dict() if not df_activity.empty else {}
@@ -1045,13 +1435,13 @@ def get_task_details():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         completed_tasks = [
@@ -1074,7 +1464,7 @@ def get_task_details():
                 'task_id': t['task_id'],
                 'name': t['name'],
                 'start': t['start'].isoformat(),
-                'elapsed': (pd.to_datetime(datetime.utcnow()) - t['start']).total_seconds(),
+                'elapsed': (pd.to_datetime(datetime.now(timezone.utc)) - t['start']).total_seconds(),
                 'domain': t['domain'],
                 'user_id': t['user_id'],
                 'session_id': t['session_id']
@@ -1096,13 +1486,13 @@ def get_page_engagement():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_engagement = pd.DataFrame([
@@ -1152,13 +1542,13 @@ def get_interaction_types():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_interactions = pd.DataFrame([
@@ -1204,13 +1594,13 @@ def get_network_performance():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_requests = pd.DataFrame([
@@ -1261,13 +1651,13 @@ def get_metrics_by_domain():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_activity = pd.DataFrame([
@@ -1316,13 +1706,13 @@ def get_user_sessions():
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
     with metrics_lock:
         df_sessions = pd.DataFrame([
@@ -1362,21 +1752,22 @@ def get_user_sessions():
 # 15. Analyse des erreurs de logs
 @app.route('/metrics/log-errors', methods=['GET'])
 def get_log_errors():
+    domain_filter = request.args.get('domain')
     time_window = request.args.get('time_window', '24h')
     try:
         if time_window.endswith('h'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=int(time_window[:-1]))
         elif time_window.endswith('d'):
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(days=int(time_window[:-1]))
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(days=int(time_window[:-1]))
         else:
-            cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+            cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
     except ValueError:
-        cutoff = pd.to_datetime(datetime.utcnow()) - pd.Timedelta(hours=24)
+        cutoff = pd.to_datetime(datetime.now(timezone.utc)) - pd.Timedelta(hours=24)
 
-    errors = redis_client.lrange('errors', 0, -1)
     errors_filtered = [
-        e for e in errors
-        if pd.to_datetime(e.split(':', 1)[0], errors='coerce') >= cutoff
+    e for e in metrics['error_details']
+    if (ts := ensure_tz_aware(e['timestamp'])) is not None and ts >= cutoff
+    and (domain_filter is None or e['domain'] == domain_filter)
     ]
     return jsonify({'errors': errors_filtered})
 

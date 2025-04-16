@@ -1,16 +1,109 @@
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
-    <title>Dashboard</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tableau de Bord Analytics Premium</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <h1>Dashboard en temps réel</h1>
-    <h2>Temps d'exécution des tâches</h2>
-    <ul>
-        {% for task, data in metrics.task_execution.average_times.items() %}
-            <li>{{ task }}: {{ data.avg }}s (Expert: {{ data.expert_avg }})</li>
-        {% endfor %}
-    </ul>
-    <!-- Ajoutez d'autres sections -->
+    <div class="container">
+        <div class="header">
+            <div id="loading" style="display: none; text-align: center; padding: 20px;">
+                <i class="fas fa-spinner fa-spin"></i> Chargement des données...
+            </div>
+            <h1>Tableau de Bord Analytics</h1>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <i class="fas fa-clock"></i>
+                <div class="stat-content">
+                    <h3>Temps Moyen par Tâche</h3>
+                    <p id="avgTaskTime">s</p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-exclamation-triangle"></i>
+                <div class="stat-content">
+                    <h3>Taux d'Erreurs</h3>
+                    <p id="formErrorRate">%</p>
+                </div>
+            </div>
+        
+            <div class="stat-card">
+                <i class="fas fa-cogs"></i>
+                <div class="stat-content">
+                    <h3>Utilisation Fonctionnalités</h3>
+                    <p id="featureUsage">%</p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-mouse-pointer"></i>
+                <div class="stat-content">
+                    <h3>Clics Redondants</h3>
+                    <p id="totalRedundantClicks"></p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-question-circle"></i>
+                <div class="stat-content">
+                    <h3>Accès à l'Aide</h3>
+                    <p id="helpUsage"></p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-check-circle"></i>
+                <div class="stat-content">
+                    <h3>Taux de Complétion</h3>
+                    <p id="taskCompletion">%</p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-keyboard"></i>
+                <div class="stat-content">
+                    <h3>Utilisation Raccourcis</h3>
+                    <p id="shortcutUsage">%</p>
+                </div>
+            </div>
+            <div class="stat-card">
+                <i class="fas fa-bell"></i>
+                <div class="stat-content">
+                    <h3>Temps Réponse Alertes</h3>
+                    <p id="alertResponseTime">s</p>
+                </div>
+            </div>
+        </div>
+        <div class="chart-container">
+            <div class="nav-tabs">
+                <div class="nav-tab active" data-chart="taskTime"><i class="fas fa-clock"></i> Temps par Tâche</div>
+                <div class="nav-tab" data-chart="alertResponse">Temps Réponse Alertes</div>
+                <div class="nav-tab" data-chart="featureUsage"><i class="fas fa-cogs"></i> Utilisation Fonctionnalités</div>
+                <div class="nav-tab" data-chart="errorRate"><i class="fas fa-exclamation-triangle"></i> Taux d'Erreurs</div>
+                <div class="nav-tab" data-chart="taskCompletion"><i class="fas fa-check-circle"></i> Complétion Tâches</div>
+            </div>
+            <canvas id="dynamicChart"></canvas>
+        </div>
+
+        <div class="table-container">
+            <h2>Tâches par Utilisateur</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID Utilisateur</th>
+                        <th>Tâche</th>
+                        <th>Date</th>
+                        <th>Temps de Réalisation</th>
+                        <th>État</th>
+                    </tr>
+                </thead>
+                <tbody id="tasksTableBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="script.js"></script>
 </body>
 </html>

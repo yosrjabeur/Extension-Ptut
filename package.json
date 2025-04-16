@@ -4,6 +4,10 @@
     "ee-first": "^1.1.1",
     "express": "^4.21.2",
     "express-validator": "^7.2.1",
-    "pg": "^8.14.1"
+    "pg": "^8.14.1",
+    "redis": "^4.7.0"
+  },
+  "scripts": {
+    "start": "node server/server.js"
   }
 }
